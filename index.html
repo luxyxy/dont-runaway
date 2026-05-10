@@ -375,7 +375,9 @@
         if (!blockFell && !stageFell) return;
 
         gameOverReported = true;
-        const winner = myId === "p1" ? "p2" : "p1";
+        // 自分のターン内に落ちた = 自分が負け = 相手がwinner
+        const loser  = myId;
+        const winner = loser === "p1" ? "p2" : "p1";
         update(ref(db, `game_rooms/${roomId}`), { state: "over", winner });
 
         setTimeout(async () => {

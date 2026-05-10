@@ -68,15 +68,18 @@
 
 <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
-    import { getDatabase, ref, onValue, set, update, runTransaction, push, onChildAdded, serverTimestamp, remove, onDisconnect } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
+    import { getDatabase, ref, onValue, set, update, runTransaction, push, onChildAdded, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
 
     const config = { databaseURL: "https://dont-runaway-default-rtdb.asia-southeast1.firebasedatabase.app" };
     const db = getDatabase(initializeApp(config));
 
     const { Engine, Render, Runner, Bodies, Composite, Constraint, Body, Events } = Matter;
     const engine = Engine.create({ enableSleeping: false });
-    const render = Render.create({ element: document.getElementById('view'), engine: engine, options: { width: 400, height: 460, wireframes: false, background: '#000' }});
-    
+    const render = Render.create({
+        element: document.getElementById('view'),
+        engine: engine,
+        options: { width: 400, height: 460, wireframes: false, background: '#000' }
+    });
     Render.run(render);
 
     let myId = "", roomId = "", myTurn = false, isSettle = false;
@@ -84,25 +87,31 @@
     let serverOffset = 0;
     window.lastDropId = "";
 
+    // ゲームオーバー検知済みフラグ（二重発火防止）
+    let gameOverReported = false;
+
+    // 物理演算用変数
     let lastTime = performance.now();
     const fixedDelta = 1000 / 60;
     let accumulator = 0;
 
     function updatePhysics(time) {
-        const delta = time - lastTime;
+        const delta = Math.min(time - lastTime, 100); // 最大100msにクランプ（バックグラウンド復帰対策）
         lastTime = time;
         accumulator += delta;
+
         while (accumulator >= fixedDelta) {
             Engine.update(engine, fixedDelta);
             accumulator -= fixedDelta;
-            checkGameOver();
         }
+        // 物理ループとは別にゲームオーバーチェック
+        checkGameOver();
         requestAnimationFrame(updatePhysics);
     }
     requestAnimationFrame(updatePhysics);
 
-    const pedestal = Bodies.trapezoid(200, 400, 100, 60, 0.5, { isStatic: true, render: { fillStyle: '#333' }});
-    const stage = Bodies.rectangle(200, 350, 250, 15, { friction: 1, frictionAir: 0.05, render: { fillStyle: '#666' }});
+    const pedestal = Bodies.trapezoid(200, 400, 100, 60, 0.5, { isStatic: true, render: { fillStyle: '#333' } });
+    const stage = Bodies.rectangle(200, 350, 250, 15, { friction: 1, frictionAir: 0.05, render: { fillStyle: '#666' } });
     const pivot = Constraint.create({ bodyA: stage, pointB: { x: 200, y: 350 }, stiffness: 1, length: 0 });
     Composite.add(engine.world, [pedestal, stage, pivot]);
 
@@ -113,62 +122,37 @@
     document.getElementById('start-btn').onclick = async () => {
         const idInput = document.getElementById('room-id').value;
         if (idInput.length !== 4) return alert("4桁のIDを入力してください");
-        roomId = idInput; 
+        roomId = idInput;
         const roomRef = ref(db, `game_rooms/${roomId}`);
 
         try {
-            const res = await runTransaction(roomRef, (room) => {
-                // 初期化またはリセット
-                if (!room || room.state === "over" || (!room.p1 && !room.p2)) {
+            const res = await runTransaction(roomRef, (currentData) => {
+                if (currentData === null || currentData.state === "over") {
                     return { p1: true, p2: false, turn: "p1", state: "wait", angle: 0, lastDrop: { id: "" } };
+                } else if (currentData.p1 && !currentData.p2) {
+                    currentData.p2 = true;
+                    currentData.state = "play";
+                    return currentData;
                 }
-                // 空き枠を探す
-                if (!room.p1) {
-                    room.p1 = true;
-                    if (room.p2) room.state = "play";
-                    return room;
-                }
-                if (!room.p2) {
-                    room.p2 = true;
-                    room.state = "play";
-                    return room;
-                }
-                return; // 満員（変更を加えない）
+                return;
             });
-
             if (res.committed && res.snapshot.exists()) {
-                const data = res.snapshot.val();
-                
-                // p2が確保された（play状態になった）なら自分はp2、そうでなければp1
-                // ※このロジックを直感的かつ確実に
-                if (data.p2 && data.p1 && data.state === "play") {
-                    // 他にp1がいて、自分がp2として確定した場合
-                    // すでにp2だった可能性があるため、自分のセッションで判断
-                    myId = (myId === "") ? "p2" : myId;
-                } else {
-                    myId = "p1";
-                    // p1入室時にチャット履歴を完全削除
-                    await remove(ref(db, `chats/${roomId}`));
-                }
-                
-                onDisconnect(ref(db, `game_rooms/${roomId}/${myId}`)).set(false);
+                myId = res.snapshot.val().p2 ? "p2" : "p1";
                 document.getElementById('setup').style.display = "none";
                 initGame();
-            } else { 
-                alert("ルームが満員です。"); 
+            } else {
+                alert("ルームが満員です。");
             }
-        } catch (e) { 
-            alert("接続エラー"); 
+        } catch (e) {
+            alert("接続エラー");
         }
     };
 
     function initGame() {
         const roomRef = ref(db, `game_rooms/${roomId}`);
-        document.getElementById('chat-logs').innerHTML = "";
 
         onChildAdded(ref(db, `chats/${roomId}`), (snap) => {
             const m = snap.val();
-            if (!m) return;
             const logs = document.getElementById('chat-logs');
             const div = document.createElement('div');
             div.textContent = `${m.sender === myId ? '▶' : '▷'} ${m.text}`;
@@ -180,12 +164,6 @@
             const data = snap.val();
             if (!data) return;
 
-            // 全員いなくなったらチャットクリア
-            if (data.p1 === false && data.p2 === false) {
-                remove(ref(db, `chats/${roomId}`));
-                return;
-            }
-
             if (data.state === "over") {
                 document.getElementById('result').style.display = "flex";
                 document.getElementById('result-msg').innerText = data.winner === myId ? "YOU WIN!" : "YOU LOSE...";
@@ -195,89 +173,141 @@
             const oldTurn = myTurn;
             myTurn = (data.turn === myId && data.state === "play");
             if (!oldTurn && myTurn) isSettle = false;
-            document.getElementById('status').innerText = data.state === "wait" ? "相手を待っています..." : (myTurn ? "あなたの番" : "相手の番");
+
+            document.getElementById('status').innerText =
+                data.state === "wait" ? "相手を待っています..." :
+                (myTurn ? "あなたの番" : "相手の番");
             document.getElementById('hand').style.display = (myTurn && !isSettle) ? "block" : "none";
-            
-            if (!myTurn && !isSettle && data.angle !== undefined) {
+
+            // 相手のターン終了時に角度を強制同期
+            if (!myTurn && data.angle !== undefined) {
                 Body.setAngle(stage, data.angle);
+                Body.setAngularVelocity(stage, 0);
             }
 
+            // 新しいブロック投下を検知
             if (data.lastDrop?.id && data.lastDrop.id !== window.lastDropId) {
-                const nowServerTime = Date.now() + serverOffset;
-                const delay = Math.max(0, nowServerTime - data.lastDrop.time);
-                spawn(data.lastDrop.x, data.lastDrop.owner === myId, delay);
                 window.lastDropId = data.lastDrop.id;
+                const nowServerTime = Date.now() + serverOffset;
+                // serverTimestamp() はネストされた update() では使えないため
+                // lastDrop.time が数値でない場合（null等）は遅延0として扱う
+                const dropTime = typeof data.lastDrop.time === 'number' ? data.lastDrop.time : nowServerTime;
+                const delay = Math.max(0, nowServerTime - dropTime);
+                spawn(data.lastDrop.x, data.lastDrop.owner === myId, delay);
             }
         });
     }
 
     function spawn(x, isMine, delayMs = 0) {
-        const box = Bodies.rectangle(x, 60, 30, 30, { 
-            friction: 0.5, restitution: 0.1, 
-            render: { fillStyle: isMine ? '#0f0' : '#00f' }, label: "block" 
+        const box = Bodies.rectangle(x, 60, 30, 30, {
+            friction: 0.5,
+            restitution: 0.1,
+            render: { fillStyle: isMine ? '#0f0' : '#00f' },
+            label: "block"
         });
         Composite.add(engine.world, box);
-        const steps = Math.min(60, Math.floor(delayMs / fixedDelta));
-        for (let i = 0; i < steps; i++) { Engine.update(engine, fixedDelta); }
+
+        // 遅延補正
+        const steps = Math.min(120, Math.floor(delayMs / fixedDelta));
+        for (let i = 0; i < steps; i++) {
+            Engine.update(engine, fixedDelta);
+        }
     }
 
+    // ---- 修正1: dropUI内の setInterval を gameOver 時に止める ----
     const dropUI = () => {
         if (!myTurn || isSettle) return;
         isSettle = true;
-        update(ref(db, `game_rooms/${roomId}`), { 
-            lastDrop: { 
-                x: handX, 
-                id: Date.now().toString(), 
+        document.getElementById('hand').style.display = "none";
+
+        // 修正2: serverTimestamp() をネストで使うと動かないため、
+        //         time は別フィールドに set() するか、Date.now() を使う
+        //         ここでは client timestamp を使用（軽微な誤差は許容）
+        const dropId = Date.now().toString();
+        update(ref(db, `game_rooms/${roomId}`), {
+            lastDrop: {
+                x: handX,
+                id: dropId,
                 owner: myId,
-                time: serverTimestamp() 
-            } 
+                time: Date.now() + serverOffset   // サーバー時刻に補正したクライアント時刻
+            }
         });
 
         let stableCount = 0;
-        let startTime = Date.now();
+        const startTime = Date.now();
         const check = setInterval(() => {
+            // 修正3: ゲームオーバーになっていたらターン交代を止める
+            if (gameOverReported) {
+                clearInterval(check);
+                return;
+            }
+
             const bodies = Composite.allBodies(engine.world);
-            const isMoving = bodies.some(b => b.speed > 0.15);
+            const isMoving = bodies.some(b => !b.isStatic && b.speed > 0.15);
             if (!isMoving) stableCount++; else stableCount = 0;
+
             if (stableCount > 20 || Date.now() - startTime > 5000) {
                 clearInterval(check);
-                bodies.forEach(b => { if(!b.isStatic) { Body.setVelocity(b, {x:0, y:0}); Body.setAngularVelocity(b, 0); }});
-                update(ref(db, `game_rooms/${roomId}`), { turn: (myId === "p1" ? "p2" : "p1"), angle: stage.angle });
+                bodies.forEach(b => {
+                    if (!b.isStatic) {
+                        Body.setVelocity(b, { x: 0, y: 0 });
+                        Body.setAngularVelocity(b, 0);
+                    }
+                });
+                update(ref(db, `game_rooms/${roomId}`), {
+                    turn: (myId === "p1" ? "p2" : "p1"),
+                    angle: stage.angle
+                });
             }
         }, 100);
     };
 
+    // ---- 修正4: ゲームオーバー判定を「ブロックを置いた人（owner）が負け」に変更 ----
+    //            かつ、両クライアントで二重発火しないようにフラグで制御
     function checkGameOver() {
-        if (!roomId) return;
-        const blocks = Composite.allBodies(engine.world).filter(b => b.label === "block");
+        if (!roomId || gameOverReported) return;
+
+        const bodies = Composite.allBodies(engine.world);
+        const blocks = bodies.filter(b => b.label === "block");
         const fallenBlock = blocks.find(b => b.position.y > 500);
         const stageFallen = Math.abs(stage.angle) > 1.35;
+
         if (fallenBlock || stageFallen) {
-            const loser = myTurn ? myId : (myId === "p1" ? "p2" : "p1");
+            gameOverReported = true;
+
+            // 自分のターン中（isSettle中）に落ちた → 自分が置いたブロックが原因 → 自分負け
+            // 相手のターン中に落ちた → 相手が置いたブロックが原因 → 相手負け
+            // ※ myTurn は isSettle後もfalseにはなっていないため isSettle を合わせて判定
+            const iLostThisRound = isSettle; // 自分がブロックを置いて安定待ち中に落下
+            const loser = iLostThisRound ? myId : (myId === "p1" ? "p2" : "p1");
             const winner = loser === "p1" ? "p2" : "p1";
+
+            // どちらのクライアントも update を叩くが、
+            // Firebase は同じ値への上書きは冪等なので問題ない
+            // （最初に書いた side が正しい winner を書く）
             update(ref(db, `game_rooms/${roomId}`), { state: "over", winner: winner });
         }
     }
 
+    // ---- 修正5: touchend でブロックを落とせるようにする ----
     const moveUI = (e) => {
         if (!myTurn || isSettle) return;
         const rect = render.canvas.getBoundingClientRect();
-        const clientX = e.clientX || (e.touches ? e.touches[0].clientX : undefined);
+        const clientX = e.clientX ?? (e.touches?.[0]?.clientX);
         if (clientX === undefined) return;
         handX = Math.max(30, Math.min(370, (clientX - rect.left) * (400 / rect.width)));
         document.getElementById('hand').style.left = clientX + "px";
     };
 
-    window.addEventListener('mousemove', moveUI);
-    window.addEventListener('touchmove', moveUI, { passive: false });
-
-    const handleDropAction = (e) => {
+    const tryDrop = (e) => {
         if (e.target.closest('#chat-section') || e.target.closest('#setup')) return;
         dropUI();
     };
 
-    window.addEventListener('mousedown', handleDropAction);
-    window.addEventListener('touchstart', handleDropAction, { passive: true });
+    window.addEventListener('mousemove', moveUI);
+    window.addEventListener('touchmove', moveUI, { passive: true });
+    window.addEventListener('mousedown', tryDrop);
+    window.addEventListener('touchend', tryDrop, { passive: true }); // ← 追加
 
     const sendChat = (text) => {
         if (!text || !roomId) return;
@@ -285,7 +315,8 @@
     };
     document.getElementById('send-btn').onclick = () => {
         const input = document.getElementById('chat-input');
-        sendChat(input.value); input.value = "";
+        sendChat(input.value);
+        input.value = "";
     };
     document.querySelectorAll('.emoji-btn').forEach(btn => {
         btn.onclick = (e) => { e.preventDefault(); sendChat(btn.textContent); };

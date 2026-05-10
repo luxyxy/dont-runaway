@@ -126,25 +126,35 @@
         const roomRef = ref(db, `game_rooms/${roomId}`);
 
         try {
+            let joinedAs = null;
+
             const res = await runTransaction(roomRef, (currentData) => {
-                if (currentData === null || currentData.state === "over") {
+                // データなし or ゲーム終了済み or 誰も居ない(p1もいない) → p1として新規作成
+                if (currentData === null || currentData.state === "over" || !currentData.p1) {
+                    joinedAs = "p1";
                     return { p1: true, p2: false, turn: "p1", state: "wait", angle: 0, lastDrop: { id: "" } };
-                } else if (currentData.p1 && !currentData.p2) {
+                }
+                // p1がいてp2がまだ居ない → p2として参加
+                if (currentData.p1 && !currentData.p2) {
+                    joinedAs = "p2";
                     currentData.p2 = true;
                     currentData.state = "play";
                     return currentData;
                 }
-                return;
+                // p1もp2も居る（満員）→ トランザクションをアボート
+                joinedAs = null;
+                return; // undefinedを返すとabort
             });
-            if (res.committed && res.snapshot.exists()) {
-                myId = res.snapshot.val().p2 ? "p2" : "p1";
+
+            if (res.committed && joinedAs) {
+                myId = joinedAs;
                 document.getElementById('setup').style.display = "none";
                 initGame();
             } else {
                 alert("ルームが満員です。");
             }
         } catch (e) {
-            alert("接続エラー");
+            alert("接続エラー: " + e.message);
         }
     };
 

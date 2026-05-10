@@ -285,17 +285,22 @@
         if (fallenBlock || stageFallen) {
             gameOverReported = true;
 
-            // 自分のターン中（isSettle中）に落ちた → 自分が置いたブロックが原因 → 自分負け
-            // 相手のターン中に落ちた → 相手が置いたブロックが原因 → 相手負け
-            // ※ myTurn は isSettle後もfalseにはなっていないため isSettle を合わせて判定
-            const iLostThisRound = isSettle; // 自分がブロックを置いて安定待ち中に落下
+            const iLostThisRound = isSettle;
             const loser = iLostThisRound ? myId : (myId === "p1" ? "p2" : "p1");
             const winner = loser === "p1" ? "p2" : "p1";
 
-            // どちらのクライアントも update を叩くが、
-            // Firebase は同じ値への上書きは冪等なので問題ない
-            // （最初に書いた side が正しい winner を書く）
             update(ref(db, `game_rooms/${roomId}`), { state: "over", winner: winner });
+
+            // 60秒後にルームとチャットを削除（両クライアントが叩くが同じ結果なので問題なし）
+            setTimeout(async () => {
+                try {
+                    await set(ref(db, `game_rooms/${roomId}`), null);
+                    await set(ref(db, `chats/${roomId}`), null);
+                    console.log(`Room ${roomId} cleaned up.`);
+                } catch (e) {
+                    console.warn("Cleanup failed:", e);
+                }
+            }, 60000);
         }
     }
 

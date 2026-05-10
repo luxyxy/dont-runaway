@@ -86,8 +86,6 @@
     let handX = 200;
     let serverOffset = 0;
     window.lastDropId = "";
-
-    // 自クライアントがゲームオーバーをFirebaseに報告済みかどうか
     let gameOverReported = false;
 
     // 物理演算ループ
@@ -103,21 +101,89 @@
             Engine.update(engine, fixedDelta);
             accumulator -= fixedDelta;
         }
-        // ゲームオーバーチェックは「自分がブロックを置いて静止待ち中」のみ実行
-        // → 自分のターン内に落下した = 自分の負け、という判定を構造的に保証する
         if (isSettle) checkGameOver();
         requestAnimationFrame(updatePhysics);
     }
     requestAnimationFrame(updatePhysics);
 
     const pedestal = Bodies.trapezoid(200, 400, 100, 60, 0.5, { isStatic: true, render: { fillStyle: '#333' } });
-    const stage = Bodies.rectangle(200, 350, 250, 15, { friction: 1, frictionAir: 0.05, render: { fillStyle: '#666' } });
-    const pivot = Constraint.create({ bodyA: stage, pointB: { x: 200, y: 350 }, stiffness: 1, length: 0 });
+    const stage    = Bodies.rectangle(200, 350, 250, 15, { friction: 1, frictionAir: 0.05, render: { fillStyle: '#666' } });
+    const pivot    = Constraint.create({ bodyA: stage, pointB: { x: 200, y: 350 }, stiffness: 1, length: 0 });
     Composite.add(engine.world, [pedestal, stage, pivot]);
 
     onValue(ref(db, ".info/serverTimeOffset"), (snap) => {
         serverOffset = snap.val() || 0;
     });
+
+    // -------------------------------------------------------
+    // スナップショット：全ブロック＋板の状態をオブジェクトにまとめる
+    // -------------------------------------------------------
+    function captureSnapshot() {
+        const blocks = Composite.allBodies(engine.world).filter(b => b.label === "block");
+        return {
+            stage: {
+                angle: stage.angle,
+                angularVelocity: stage.angularVelocity
+            },
+            blocks: blocks.map(b => ({
+                id:    b.id,
+                owner: b.render.fillStyle === '#0f0' ? 'p1' : 'p2',
+                x:     Math.round(b.position.x * 100) / 100,
+                y:     Math.round(b.position.y * 100) / 100,
+                angle: Math.round(b.angle * 10000) / 10000,
+                vx:    Math.round(b.velocity.x * 1000) / 1000,
+                vy:    Math.round(b.velocity.y * 1000) / 1000,
+                av:    Math.round(b.angularVelocity * 1000) / 1000
+            }))
+        };
+    }
+
+    // -------------------------------------------------------
+    // スナップショットを物理世界に適用する
+    // 既存ブロックはIDで突き合わせて位置修正、存在しないものは新規生成
+    // -------------------------------------------------------
+    function applySnapshot(snapshot) {
+        if (!snapshot) return;
+
+        // 板を同期
+        Body.setAngle(stage, snapshot.stage.angle);
+        Body.setAngularVelocity(stage, snapshot.stage.angularVelocity ?? 0);
+
+        const existingBlocks = Composite.allBodies(engine.world).filter(b => b.label === "block");
+        const existingMap    = new Map(existingBlocks.map(b => [b.id, b]));
+        const snapshotIds    = new Set(snapshot.blocks.map(b => b.id));
+
+        // スナップショットに無いブロック（落下済み等）を削除
+        existingBlocks.forEach(b => {
+            if (!snapshotIds.has(b.id)) Composite.remove(engine.world, b);
+        });
+
+        // スナップショットの各ブロックを適用
+        snapshot.blocks.forEach(sb => {
+            if (existingMap.has(sb.id)) {
+                // 既存ブロック → 位置・速度を強制上書き
+                const b = existingMap.get(sb.id);
+                Body.setPosition(b, { x: sb.x, y: sb.y });
+                Body.setAngle(b, sb.angle);
+                Body.setVelocity(b, { x: sb.vx, y: sb.vy });
+                Body.setAngularVelocity(b, sb.av);
+            } else {
+                // 存在しないブロック → 新規生成して正しい位置に配置
+                const color = sb.owner === 'p1' ? '#0f0' : '#00f';
+                const box = Bodies.rectangle(sb.x, sb.y, 30, 30, {
+                    friction: 0.5, restitution: 0.1,
+                    render: { fillStyle: color },
+                    label: "block"
+                });
+                // MatterはIDを自動採番するため、スナップショットのIDを上書きして突き合わせに使う
+                box.id = sb.id;
+                Body.setAngle(box, sb.angle);
+                Body.setVelocity(box, { x: sb.vx, y: sb.vy });
+                Body.setAngularVelocity(box, sb.av);
+                Composite.add(engine.world, box);
+            }
+        });
+    }
 
     // -------------------------------------------------------
     // ルーム入室
@@ -142,7 +208,7 @@
                     return currentData;
                 }
                 joinedAs = null;
-                return; // abort（満員）
+                return;
             });
 
             if (res.committed && joinedAs) {
@@ -166,7 +232,7 @@
         onChildAdded(ref(db, `chats/${roomId}`), (snap) => {
             const m = snap.val();
             const logs = document.getElementById('chat-logs');
-            const div = document.createElement('div');
+            const div  = document.createElement('div');
             div.textContent = `${m.sender === myId ? '▶' : '▷'} ${m.text}`;
             logs.appendChild(div);
             logs.scrollTop = logs.scrollHeight;
@@ -184,8 +250,6 @@
 
             const oldTurn = myTurn;
             myTurn = (data.turn === myId && data.state === "play");
-
-            // 自分のターンが新たに来た → isSettle をリセット（次のブロックを置けるように）
             if (!oldTurn && myTurn) isSettle = false;
 
             document.getElementById('status').innerText =
@@ -193,27 +257,30 @@
                 (myTurn ? "あなたの番" : "相手の番");
             document.getElementById('hand').style.display = (myTurn && !isSettle) ? "block" : "none";
 
-            // 相手ターンに切り替わった瞬間：ステージ角度を強制同期してズレを補正
-            if (!myTurn && data.angle !== undefined) {
-                Body.setAngle(stage, data.angle);
-                Body.setAngularVelocity(stage, 0);
+            // ターンが自分に切り替わった瞬間：相手が送ったスナップショットを適用
+            // → これでブロック群の位置が毎ターン完全にリセット・同期される
+            if (!oldTurn && myTurn && data.snapshot) {
+                applySnapshot(data.snapshot);
             }
 
-            // 新しいブロック投下を検知してスポーン
+            // 新しいブロック投下を検知：自分側にスポーンする
+            // （相手ターン中に相手が置いたブロックを自分の画面に出す）
             if (data.lastDrop?.id && data.lastDrop.id !== window.lastDropId) {
                 window.lastDropId = data.lastDrop.id;
-                const nowServerTime = Date.now() + serverOffset;
-                const dropTime = typeof data.lastDrop.time === 'number' ? data.lastDrop.time : nowServerTime;
-                const delay = Math.max(0, nowServerTime - dropTime);
-                spawn(data.lastDrop.x, data.lastDrop.owner === myId, delay);
+                // 自分がブロックを置いた場合はdropUI内で既にspawn済みなのでスキップ
+                if (data.lastDrop.owner !== myId) {
+                    spawnBlock(data.lastDrop.x, false);
+                }
             }
         });
     }
 
     // -------------------------------------------------------
-    // ブロックをスポーン（遅延補正付き）
+    // ブロックをスポーン
+    // 遅延補正は廃止：スナップショット同期に切り替えたため不要
+    // 相手のブロックはスナップショット適用時に正しい位置へ上書きされる
     // -------------------------------------------------------
-    function spawn(x, isMine, delayMs = 0) {
+    function spawnBlock(x, isMine) {
         const box = Bodies.rectangle(x, 60, 30, 30, {
             friction: 0.5,
             restitution: 0.1,
@@ -221,11 +288,7 @@
             label: "block"
         });
         Composite.add(engine.world, box);
-
-        const steps = Math.min(120, Math.floor(delayMs / fixedDelta));
-        for (let i = 0; i < steps; i++) {
-            Engine.update(engine, fixedDelta);
-        }
+        return box;
     }
 
     // -------------------------------------------------------
@@ -236,34 +299,34 @@
         isSettle = true;
         document.getElementById('hand').style.display = "none";
 
+        // 自分の画面にまずスポーン
+        spawnBlock(handX, true);
+
+        // Firebaseに投下情報を送る（相手がspawnBlockするためのトリガー）
         update(ref(db, `game_rooms/${roomId}`), {
             lastDrop: {
-                x: handX,
-                id: Date.now().toString(),
+                x:     handX,
+                id:    Date.now().toString(),
                 owner: myId,
-                time: Date.now() + serverOffset
+                time:  Date.now() + serverOffset
             }
         });
 
-        // ブロックを置いた側だけが静止を監視してターン交代を行う
         waitForStableAndPassTurn();
     };
 
     // -------------------------------------------------------
     // 静止監視 → ターン交代
-    //
-    // 100ms間隔でチェック。
-    //   全ボディの速度が閾値以下の状態が STABLE_NEED 回連続 → 安定とみなす
-    //   TIMEOUT_MS 経過で強制交代（ずっと揺れ続ける場合の保険）
+    // ターン交代時にスナップショットをFirebaseへ保存する
+    // 相手はターン開始時にこれを受け取って物理状態を同期する
     // -------------------------------------------------------
     function waitForStableAndPassTurn() {
         let stableCount = 0;
-        const STABLE_NEED = 20;    // 100ms × 20 = 約2秒間静止で確定
-        const TIMEOUT_MS  = 6000;  // 最大6秒で強制交代
+        const STABLE_NEED = 20;   // 100ms × 20 = 約2秒
+        const TIMEOUT_MS  = 6000; // 最大6秒で強制交代
         const startTime   = Date.now();
 
         const check = setInterval(() => {
-            // ゲームオーバーが確定していたらターン交代は不要
             if (gameOverReported) {
                 clearInterval(check);
                 return;
@@ -271,7 +334,7 @@
 
             const bodies = Composite.allBodies(engine.world);
             const moving = bodies.some(b => !b.isStatic && b.speed > 0.15);
-            stableCount = moving ? 0 : stableCount + 1;
+            stableCount  = moving ? 0 : stableCount + 1;
 
             const stable   = stableCount >= STABLE_NEED;
             const timedOut = Date.now() - startTime >= TIMEOUT_MS;
@@ -280,7 +343,7 @@
                 clearInterval(check);
                 if (gameOverReported) return;
 
-                // 全ボディを完全停止させてから交代（物理ズレ防止）
+                // 全ボディを完全停止させる
                 bodies.forEach(b => {
                     if (!b.isStatic) {
                         Body.setVelocity(b, { x: 0, y: 0 });
@@ -288,23 +351,18 @@
                     }
                 });
 
-                // ターンを相手に渡す。板の角度も記録して相手側と同期
+                // ★スナップショットを取得してFirebaseに保存してからターン交代★
+                const snapshot = captureSnapshot();
                 update(ref(db, `game_rooms/${roomId}`), {
-                    turn: myId === "p1" ? "p2" : "p1",
-                    angle: stage.angle
+                    turn:     myId === "p1" ? "p2" : "p1",
+                    snapshot: snapshot   // 相手がターン開始時にこれを適用する
                 });
             }
         }, 100);
     }
 
     // -------------------------------------------------------
-    // ゲームオーバー判定
-    //
-    // ★ルール★
-    //   自分のターン内（isSettle === true の間）にブロックが落ちたら自分の負け。
-    //   この関数は updatePhysics から isSettle === true のときだけ呼ばれるため、
-    //   相手ターン中の落下は相手クライアントが検知・報告する。
-    //   万一両クライアントが同時に報告しても winner の値は同じになるので問題なし。
+    // ゲームオーバー判定（自分のターン内のみ呼ばれる）
     // -------------------------------------------------------
     function checkGameOver() {
         if (!roomId || gameOverReported) return;
@@ -317,12 +375,9 @@
         if (!blockFell && !stageFell) return;
 
         gameOverReported = true;
-
-        // isSettle 中（自分のターン内）に落下したので自分が負け
         const winner = myId === "p1" ? "p2" : "p1";
         update(ref(db, `game_rooms/${roomId}`), { state: "over", winner });
 
-        // 60秒後にルームデータを削除
         setTimeout(async () => {
             try {
                 await set(ref(db, `game_rooms/${roomId}`), null);
@@ -338,7 +393,7 @@
     // -------------------------------------------------------
     const moveUI = (e) => {
         if (!myTurn || isSettle) return;
-        const rect = render.canvas.getBoundingClientRect();
+        const rect    = render.canvas.getBoundingClientRect();
         const clientX = e.clientX ?? e.touches?.[0]?.clientX;
         if (clientX === undefined) return;
         handX = Math.max(30, Math.min(370, (clientX - rect.left) * (400 / rect.width)));

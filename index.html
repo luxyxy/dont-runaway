@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>逃げるな</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+    <style>
+        body { background: #000; color: #0f0; font-family: monospace; margin: 0; overflow: hidden; display: flex; flex-direction: column; align-items: center; }
+        #header { width: 100%; background: #010; padding: 10px; border-bottom: 2px solid #0f0; display: flex; justify-content: space-between; box-sizing: border-box; }
+        #game-container { position: relative; width: 400px; height: 460px; margin-top: 5px; }
+        canvas { border: 2px solid #555; background: #000; }
+        #hand { position: absolute; top: 0px; width: 60px; height: 40px; pointer-events: none; transform: translateX(-50%); z-index: 10; display: none; }
+        #chat-section { width: 400px; background: #111; border: 1px solid #0f0; margin-top: 5px; display: flex; flex-direction: column; }
+        #chat-logs { height: 80px; overflow-y: auto; font-size: 12px; padding: 5px; border-bottom: 1px solid #333; color: #ccc; }
+        #chat-controls { display: flex; align-items: center; padding: 5px; background: #000; }
+        #emoji-shelf { display: flex; gap: 5px; margin-right: 10px; border-right: 1px solid #333; padding-right: 10px; }
+        .emoji-btn { background: none; border: none; font-size: 1.2rem; cursor: pointer; padding: 0; }
+        #chat-input { flex-grow: 1; background: #000; border: 1px solid #0f0; color: #0f0; padding: 5px; min-width: 0; }
+        #send-btn { background: #0f0; color: #000; border: none; padding: 5px 10px; margin-left: 5px; cursor: pointer; font-weight: bold; }
+        .overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.9); display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 100; }
+        #start-btn { background: #000; border: 1px solid #0f0; color: #0f0; padding: 10px 20px; font-size: 1.2rem; cursor: pointer; margin-top: 10px; }
+    </style>
+</head>
+<body>
+
+<div id="header">
+    <div id="status">4桁のIDを入力</div>
+    <div id="turn-info">---</div>
+</div>
+
+<div id="game-container">
+    <div id="hand">
+        <svg viewBox="0 0 64 40">
+            <ellipse cx="32" cy="25" rx="30" ry="10" fill="#777" stroke="#0f0" stroke-width="2"/>
+            <path d="M15 22 C 15 10, 49 10, 49 22" fill="#0ff" opacity="0.6" stroke="#0f0"/>
+            <rect x="20" y="30" width="4" height="4" fill="#f00"/><rect x="30" y="32" width="4" height="4" fill="#ff0"/><rect x="40" y="30" width="4" height="4" fill="#f00"/>
+        </svg>
+    </div>
+    <div id="view"></div>
+</div>
+
+<div id="chat-section">
+    <div id="chat-logs"></div>
+    <div id="chat-controls">
+        <div id="emoji-shelf">
+            <button class="emoji-btn">😊</button>
+            <button class="emoji-btn">😲</button>
+            <button class="emoji-btn">😭</button>
+            <button class="emoji-btn">😇</button>
+            <button class="emoji-btn">💢</button>
+        </div>
+        <input type="text" id="chat-input" placeholder="MSG..." maxlength="20">
+        <button id="send-btn">PUSH</button>
+    </div>
+</div>
+
+<div id="setup" class="overlay">
+    <h1 style="font-size: 3.5rem; margin-bottom: 10px;">逃げるな</h1>
+    <input type="text" id="room-id" placeholder="ID (4桁)" maxlength="4" style="background:#000; color:#0f0; border:1px solid #0f0; padding:10px; font-size:1.5rem; text-align:center; width:150px;">
+    <button id="start-btn">ENTRY</button>
+</div>
+
+<div id="result" class="overlay" style="display:none">
+    <h1 id="result-msg" style="font-size:3rem; color:#f00;"></h1>
+    <button onclick="location.reload()" style="background:#000; color:#0f0; border:1px solid #0f0; padding:10px;">もう一度遊ぶ</button>
+</div>
+
+<script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+    import { getDatabase, ref, onValue, set, update, runTransaction, push, onChildAdded, serverTimestamp, remove, onDisconnect } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
+
+    const config = { databaseURL: "https://dont-runaway-default-rtdb.asia-southeast1.firebasedatabase.app" };
+    const db = getDatabase(initializeApp(config));
+
+    const { Engine, Render, Runner, Bodies, Composite, Constraint, Body, Events } = Matter;
+    const engine = Engine.create({ enableSleeping: false });
+    const render = Render.create({ element: document.getElementById('view'), engine: engine, options: { width: 400, height: 460, wireframes: false, background: '#000' }});
+    
+    Render.run(render);
+
+    let myId = "", roomId = "", myTurn = false, isSettle = false;
+    let handX = 200;
+    let serverOffset = 0;
+    window.lastDropId = "";
+
+    let lastTime = performance.now();
+    const fixedDelta = 1000 / 60;
+    let accumulator = 0;
+
+    function updatePhysics(time) {
+        const delta = time - lastTime;
+        lastTime = time;
+        accumulator += delta;
+        while (accumulator >= fixedDelta) {
+            Engine.update(engine, fixedDelta);
+            accumulator -= fixedDelta;
+            checkGameOver();
+        }
+        requestAnimationFrame(updatePhysics);
+    }
+    requestAnimationFrame(updatePhysics);
+
+    const pedestal = Bodies.trapezoid(200, 400, 100, 60, 0.5, { isStatic: true, render: { fillStyle: '#333' }});
+    const stage = Bodies.rectangle(200, 350, 250, 15, { friction: 1, frictionAir: 0.05, render: { fillStyle: '#666' }});
+    const pivot = Constraint.create({ bodyA: stage, pointB: { x: 200, y: 350 }, stiffness: 1, length: 0 });
+    Composite.add(engine.world, [pedestal, stage, pivot]);
+
+    onValue(ref(db, ".info/serverTimeOffset"), (snap) => {
+        serverOffset = snap.val() || 0;
+    });
+
+    document.getElementById('start-btn').onclick = async () => {
+        const idInput = document.getElementById('room-id').value;
+        if (idInput.length !== 4) return alert("4桁のIDを入力してください");
+        roomId = idInput; 
+        const roomRef = ref(db, `game_rooms/${roomId}`);
+
+        try {
+            const res = await runTransaction(roomRef, (room) => {
+                // 初期化またはリセット
+                if (!room || room.state === "over" || (!room.p1 && !room.p2)) {
+                    return { p1: true, p2: false, turn: "p1", state: "wait", angle: 0, lastDrop: { id: "" } };
+                }
+                // 空き枠を探す
+                if (!room.p1) {
+                    room.p1 = true;
+                    if (room.p2) room.state = "play";
+                    return room;
+                }
+                if (!room.p2) {
+                    room.p2 = true;
+                    room.state = "play";
+                    return room;
+                }
+                return; // 満員（変更を加えない）
+            });
+
+            if (res.committed && res.snapshot.exists()) {
+                const data = res.snapshot.val();
+                
+                // p2が確保された（play状態になった）なら自分はp2、そうでなければp1
+                // ※このロジックを直感的かつ確実に
+                if (data.p2 && data.p1 && data.state === "play") {
+                    // 他にp1がいて、自分がp2として確定した場合
+                    // すでにp2だった可能性があるため、自分のセッションで判断
+                    myId = (myId === "") ? "p2" : myId;
+                } else {
+                    myId = "p1";
+                    // p1入室時にチャット履歴を完全削除
+                    await remove(ref(db, `chats/${roomId}`));
+                }
+                
+                onDisconnect(ref(db, `game_rooms/${roomId}/${myId}`)).set(false);
+                document.getElementById('setup').style.display = "none";
+                initGame();
+            } else { 
+                alert("ルームが満員です。"); 
+            }
+        } catch (e) { 
+            alert("接続エラー"); 
+        }
+    };
+
+    function initGame() {
+        const roomRef = ref(db, `game_rooms/${roomId}`);
+        document.getElementById('chat-logs').innerHTML = "";
+
+        onChildAdded(ref(db, `chats/${roomId}`), (snap) => {
+            const m = snap.val();
+            if (!m) return;
+            const logs = document.getElementById('chat-logs');
+            const div = document.createElement('div');
+            div.textContent = `${m.sender === myId ? '▶' : '▷'} ${m.text}`;
+            logs.appendChild(div);
+            logs.scrollTop = logs.scrollHeight;
+        });
+
+        onValue(roomRef, (snap) => {
+            const data = snap.val();
+            if (!data) return;
+
+            // 全員いなくなったらチャットクリア
+            if (data.p1 === false && data.p2 === false) {
+                remove(ref(db, `chats/${roomId}`));
+                return;
+            }
+
+            if (data.state === "over") {
+                document.getElementById('result').style.display = "flex";
+                document.getElementById('result-msg').innerText = data.winner === myId ? "YOU WIN!" : "YOU LOSE...";
+                return;
+            }
+
+            const oldTurn = myTurn;
+            myTurn = (data.turn === myId && data.state === "play");
+            if (!oldTurn && myTurn) isSettle = false;
+            document.getElementById('status').innerText = data.state === "wait" ? "相手を待っています..." : (myTurn ? "あなたの番" : "相手の番");
+            document.getElementById('hand').style.display = (myTurn && !isSettle) ? "block" : "none";
+            
+            if (!myTurn && !isSettle && data.angle !== undefined) {
+                Body.setAngle(stage, data.angle);
+            }
+
+            if (data.lastDrop?.id && data.lastDrop.id !== window.lastDropId) {
+                const nowServerTime = Date.now() + serverOffset;
+                const delay = Math.max(0, nowServerTime - data.lastDrop.time);
+                spawn(data.lastDrop.x, data.lastDrop.owner === myId, delay);
+                window.lastDropId = data.lastDrop.id;
+            }
+        });
+    }
+
+    function spawn(x, isMine, delayMs = 0) {
+        const box = Bodies.rectangle(x, 60, 30, 30, { 
+            friction: 0.5, restitution: 0.1, 
+            render: { fillStyle: isMine ? '#0f0' : '#00f' }, label: "block" 
+        });
+        Composite.add(engine.world, box);
+        const steps = Math.min(60, Math.floor(delayMs / fixedDelta));
+        for (let i = 0; i < steps; i++) { Engine.update(engine, fixedDelta); }
+    }
+
+    const dropUI = () => {
+        if (!myTurn || isSettle) return;
+        isSettle = true;
+        update(ref(db, `game_rooms/${roomId}`), { 
+            lastDrop: { 
+                x: handX, 
+                id: Date.now().toString(), 
+                owner: myId,
+                time: serverTimestamp() 
+            } 
+        });
+
+        let stableCount = 0;
+        let startTime = Date.now();
+        const check = setInterval(() => {
+            const bodies = Composite.allBodies(engine.world);
+            const isMoving = bodies.some(b => b.speed > 0.15);
+            if (!isMoving) stableCount++; else stableCount = 0;
+            if (stableCount > 20 || Date.now() - startTime > 5000) {
+                clearInterval(check);
+                bodies.forEach(b => { if(!b.isStatic) { Body.setVelocity(b, {x:0, y:0}); Body.setAngularVelocity(b, 0); }});
+                update(ref(db, `game_rooms/${roomId}`), { turn: (myId === "p1" ? "p2" : "p1"), angle: stage.angle });
+            }
+        }, 100);
+    };
+
+    function checkGameOver() {
+        if (!roomId) return;
+        const blocks = Composite.allBodies(engine.world).filter(b => b.label === "block");
+        const fallenBlock = blocks.find(b => b.position.y > 500);
+        const stageFallen = Math.abs(stage.angle) > 1.35;
+        if (fallenBlock || stageFallen) {
+            const loser = myTurn ? myId : (myId === "p1" ? "p2" : "p1");
+            const winner = loser === "p1" ? "p2" : "p1";
+            update(ref(db, `game_rooms/${roomId}`), { state: "over", winner: winner });
+        }
+    }
+
+    const moveUI = (e) => {
+        if (!myTurn || isSettle) return;
+        const rect = render.canvas.getBoundingClientRect();
+        const clientX = e.clientX || (e.touches ? e.touches[0].clientX : undefined);
+        if (clientX === undefined) return;
+        handX = Math.max(30, Math.min(370, (clientX - rect.left) * (400 / rect.width)));
+        document.getElementById('hand').style.left = clientX + "px";
+    };
+
+    window.addEventListener('mousemove', moveUI);
+    window.addEventListener('touchmove', moveUI, { passive: false });
+
+    const handleDropAction = (e) => {
+        if (e.target.closest('#chat-section') || e.target.closest('#setup')) return;
+        dropUI();
+    };
+
+    window.addEventListener('mousedown', handleDropAction);
+    window.addEventListener('touchstart', handleDropAction, { passive: true });
+
+    const sendChat = (text) => {
+        if (!text || !roomId) return;
+        push(ref(db, `chats/${roomId}`), { sender: myId, text: text });
+    };
+    document.getElementById('send-btn').onclick = () => {
+        const input = document.getElementById('chat-input');
+        sendChat(input.value); input.value = "";
+    };
+    document.querySelectorAll('.emoji-btn').forEach(btn => {
+        btn.onclick = (e) => { e.preventDefault(); sendChat(btn.textContent); };
+    });
+</script>
+</body>
+</html>

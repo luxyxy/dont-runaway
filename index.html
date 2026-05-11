@@ -88,6 +88,13 @@
     window.lastDropId = "";
     let gameOverReported = false;
 
+    // ★ここが重要★
+    // 「自分がブロックを置いたターンの落下責任者かどうか」を示すフラグ。
+    // isSettle はターン交代時に false に戻るが、このフラグは
+    // 次の自分のターンが始まるまで true のまま維持する。
+    // これにより「ターン交代後も自分がゲームオーバー判定の責任を持つ」期間を作れる。
+    let iAmResponsible = false;
+
     // 物理演算ループ
     let lastTime = performance.now();
     const fixedDelta = 1000 / 60;
@@ -101,7 +108,9 @@
             Engine.update(engine, fixedDelta);
             accumulator -= fixedDelta;
         }
-        if (isSettle) checkGameOver();
+        // isSettle ではなく iAmResponsible で判定する
+        // → ターン交代でisSettleがリセットされても、落下責任は自分が持ち続ける
+        if (iAmResponsible) checkGameOver();
         requestAnimationFrame(updatePhysics);
     }
     requestAnimationFrame(updatePhysics);
@@ -116,7 +125,7 @@
     });
 
     // -------------------------------------------------------
-    // スナップショット：全ブロック＋板の状態をオブジェクトにまとめる
+    // スナップショット：全ブロック＋板の状態をまとめる
     // -------------------------------------------------------
     function captureSnapshot() {
         const blocks = Composite.allBodies(engine.world).filter(b => b.label === "block");
@@ -140,12 +149,10 @@
 
     // -------------------------------------------------------
     // スナップショットを物理世界に適用する
-    // 既存ブロックはIDで突き合わせて位置修正、存在しないものは新規生成
     // -------------------------------------------------------
     function applySnapshot(snapshot) {
         if (!snapshot) return;
 
-        // 板を同期
         Body.setAngle(stage, snapshot.stage.angle);
         Body.setAngularVelocity(stage, snapshot.stage.angularVelocity ?? 0);
 
@@ -153,29 +160,24 @@
         const existingMap    = new Map(existingBlocks.map(b => [b.id, b]));
         const snapshotIds    = new Set(snapshot.blocks.map(b => b.id));
 
-        // スナップショットに無いブロック（落下済み等）を削除
         existingBlocks.forEach(b => {
             if (!snapshotIds.has(b.id)) Composite.remove(engine.world, b);
         });
 
-        // スナップショットの各ブロックを適用
         snapshot.blocks.forEach(sb => {
             if (existingMap.has(sb.id)) {
-                // 既存ブロック → 位置・速度を強制上書き
                 const b = existingMap.get(sb.id);
                 Body.setPosition(b, { x: sb.x, y: sb.y });
                 Body.setAngle(b, sb.angle);
                 Body.setVelocity(b, { x: sb.vx, y: sb.vy });
                 Body.setAngularVelocity(b, sb.av);
             } else {
-                // 存在しないブロック → 新規生成して正しい位置に配置
                 const color = sb.owner === 'p1' ? '#0f0' : '#00f';
                 const box = Bodies.rectangle(sb.x, sb.y, 30, 30, {
                     friction: 0.5, restitution: 0.1,
                     render: { fillStyle: color },
                     label: "block"
                 });
-                // MatterはIDを自動採番するため、スナップショットのIDを上書きして突き合わせに使う
                 box.id = sb.id;
                 Body.setAngle(box, sb.angle);
                 Body.setVelocity(box, { x: sb.vx, y: sb.vy });
@@ -250,24 +252,28 @@
 
             const oldTurn = myTurn;
             myTurn = (data.turn === myId && data.state === "play");
-            if (!oldTurn && myTurn) isSettle = false;
+
+            if (!oldTurn && myTurn) {
+                // 自分のターンが新たに来た
+                isSettle = false;
+                // 自分のターンになった = 前のターン（相手のターン）の責任は終わり
+                // 自分がブロックを置くまで責任はまだ発生しない
+                iAmResponsible = false;
+            }
 
             document.getElementById('status').innerText =
                 data.state === "wait" ? "相手を待っています..." :
                 (myTurn ? "あなたの番" : "相手の番");
             document.getElementById('hand').style.display = (myTurn && !isSettle) ? "block" : "none";
 
-            // ターンが自分に切り替わった瞬間：相手が送ったスナップショットを適用
-            // → これでブロック群の位置が毎ターン完全にリセット・同期される
+            // ターンが自分に切り替わった瞬間：スナップショットを適用
             if (!oldTurn && myTurn && data.snapshot) {
                 applySnapshot(data.snapshot);
             }
 
-            // 新しいブロック投下を検知：自分側にスポーンする
-            // （相手ターン中に相手が置いたブロックを自分の画面に出す）
+            // 相手のブロック投下を検知してスポーン
             if (data.lastDrop?.id && data.lastDrop.id !== window.lastDropId) {
                 window.lastDropId = data.lastDrop.id;
-                // 自分がブロックを置いた場合はdropUI内で既にspawn済みなのでスキップ
                 if (data.lastDrop.owner !== myId) {
                     spawnBlock(data.lastDrop.x, false);
                 }
@@ -277,8 +283,6 @@
 
     // -------------------------------------------------------
     // ブロックをスポーン
-    // 遅延補正は廃止：スナップショット同期に切り替えたため不要
-    // 相手のブロックはスナップショット適用時に正しい位置へ上書きされる
     // -------------------------------------------------------
     function spawnBlock(x, isMine) {
         const box = Bodies.rectangle(x, 60, 30, 30, {
@@ -297,12 +301,12 @@
     const dropUI = () => {
         if (!myTurn || isSettle) return;
         isSettle = true;
+        // ブロックを置いた瞬間から、このターンの落下は自分の責任
+        iAmResponsible = true;
         document.getElementById('hand').style.display = "none";
 
-        // 自分の画面にまずスポーン
         spawnBlock(handX, true);
 
-        // Firebaseに投下情報を送る（相手がspawnBlockするためのトリガー）
         update(ref(db, `game_rooms/${roomId}`), {
             lastDrop: {
                 x:     handX,
@@ -317,13 +321,11 @@
 
     // -------------------------------------------------------
     // 静止監視 → ターン交代
-    // ターン交代時にスナップショットをFirebaseへ保存する
-    // 相手はターン開始時にこれを受け取って物理状態を同期する
     // -------------------------------------------------------
     function waitForStableAndPassTurn() {
         let stableCount = 0;
-        const STABLE_NEED = 20;   // 100ms × 20 = 約2秒
-        const TIMEOUT_MS  = 6000; // 最大6秒で強制交代
+        const STABLE_NEED = 20;
+        const TIMEOUT_MS  = 6000;
         const startTime   = Date.now();
 
         const check = setInterval(() => {
@@ -343,7 +345,6 @@
                 clearInterval(check);
                 if (gameOverReported) return;
 
-                // 全ボディを完全停止させる
                 bodies.forEach(b => {
                     if (!b.isStatic) {
                         Body.setVelocity(b, { x: 0, y: 0 });
@@ -351,18 +352,23 @@
                     }
                 });
 
-                // ★スナップショットを取得してFirebaseに保存してからターン交代★
                 const snapshot = captureSnapshot();
                 update(ref(db, `game_rooms/${roomId}`), {
                     turn:     myId === "p1" ? "p2" : "p1",
-                    snapshot: snapshot   // 相手がターン開始時にこれを適用する
+                    snapshot: snapshot
                 });
+                // ターン交代を送信した後も iAmResponsible は true のまま。
+                // onValue で相手のターンになったことを検知して
+                // iAmResponsible = false にする（上記 initGame 内）。
+                // これにより「ターン交代直後に落ちた場合」も自分の責任として処理できる。
             }
         }, 100);
     }
 
     // -------------------------------------------------------
-    // ゲームオーバー判定（自分のターン内のみ呼ばれる）
+    // ゲームオーバー判定
+    // iAmResponsible が true の間だけ呼ばれる。
+    // 「自分がブロックを置いたターン内（およびターン交代直後）に落ちたら自分の負け」
     // -------------------------------------------------------
     function checkGameOver() {
         if (!roomId || gameOverReported) return;
@@ -375,9 +381,10 @@
         if (!blockFell && !stageFell) return;
 
         gameOverReported = true;
-        // 自分のターン内に落ちた = 自分が負け = 相手がwinner
-        const loser  = myId;
-        const winner = loser === "p1" ? "p2" : "p1";
+        iAmResponsible   = false;
+
+        // 自分が置いたターンに落ちた → 自分が負け → 相手が winner
+        const winner = myId === "p1" ? "p2" : "p1";
         update(ref(db, `game_rooms/${roomId}`), { state: "over", winner });
 
         setTimeout(async () => {
@@ -393,24 +400,55 @@
     // -------------------------------------------------------
     // 入力イベント
     // -------------------------------------------------------
-    const moveUI = (e) => {
-        if (!myTurn || isSettle) return;
-        const rect    = render.canvas.getBoundingClientRect();
-        const clientX = e.clientX ?? e.touches?.[0]?.clientX;
-        if (clientX === undefined) return;
-        handX = Math.max(30, Math.min(370, (clientX - rect.left) * (400 / rect.width)));
-        document.getElementById('hand').style.left = clientX + "px";
+    const hand = document.getElementById('hand');
+    const gameContainer = document.getElementById('game-container');
+
+    // ゲーム内座標（物理演算用）とコンテナ上の表示座標を両方更新
+    const updateHandPosition = (clientX) => {
+        const canvasRect    = render.canvas.getBoundingClientRect();
+        const containerRect = gameContainer.getBoundingClientRect();
+
+        // ゲーム内座標（0〜400のゲーム座標系）
+        handX = Math.max(30, Math.min(370,
+            (clientX - canvasRect.left) * (400 / canvasRect.width)
+        ));
+
+        // 表示座標（コンテナ内のローカルX）
+        const localX = clientX - containerRect.left;
+        hand.style.left = Math.max(0, Math.min(containerRect.width, localX)) + 'px';
     };
 
-    const tryDrop = (e) => {
+    // タッチ：touchmove で位置を追跡し、touchend でドロップ
+    // touchend 時には touches が空になるため、直前の handX をそのまま使う
+    const onTouchMove = (e) => {
+        if (!myTurn || isSettle) return;
+        e.preventDefault(); // スクロール防止
+        const clientX = e.touches?.[0]?.clientX;
+        if (clientX === undefined) return;
+        updateHandPosition(clientX);
+    };
+
+    const onTouchEnd = (e) => {
         if (e.target.closest('#chat-section') || e.target.closest('#setup')) return;
         dropUI();
     };
 
-    window.addEventListener('mousemove', moveUI);
-    window.addEventListener('touchmove', moveUI, { passive: true });
-    window.addEventListener('mousedown', tryDrop);
-    window.addEventListener('touchend', tryDrop, { passive: true });
+    // マウス：mousemove で追跡し、mouseup でドロップ
+    // mousedown より mouseup の方がクリック位置が安定する
+    const onMouseMove = (e) => {
+        if (!myTurn || isSettle) return;
+        updateHandPosition(e.clientX);
+    };
+
+    const onMouseUp = (e) => {
+        if (e.target.closest('#chat-section') || e.target.closest('#setup')) return;
+        dropUI();
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup',   onMouseUp);
+    window.addEventListener('touchmove', onTouchMove, { passive: false });
+    window.addEventListener('touchend',  onTouchEnd,  { passive: true });
 
     // -------------------------------------------------------
     // チャット

@@ -245,8 +245,16 @@
             if (!data) return;
 
             if (data.state === "over") {
+                // 一度表示したら上書きしない
+                if (!gameOverReported) {
+                    gameOverReported = true;
+                    iAmResponsible   = false;
+                }
                 document.getElementById('result').style.display = "flex";
-                document.getElementById('result-msg').innerText = data.winner === myId ? "YOU WIN!" : "YOU LOSE...";
+                // winner が確定している場合だけ表示。nullなら待機（上書き競合対策）
+                if (data.winner) {
+                    document.getElementById('result-msg').innerText = data.winner === myId ? "YOU WIN!" : "YOU LOSE...";
+                }
                 return;
             }
 
@@ -384,8 +392,13 @@
         iAmResponsible   = false;
 
         // 自分が置いたターンに落ちた → 自分が負け → 相手が winner
+        // runTransaction で「まだ over でない場合だけ書き込む」ことで
+        // 両クライアントが同時に検知しても winner が上書きされるのを防ぐ
         const winner = myId === "p1" ? "p2" : "p1";
-        update(ref(db, `game_rooms/${roomId}`), { state: "over", winner });
+        runTransaction(ref(db, `game_rooms/${roomId}`), (current) => {
+            if (!current || current.state === "over") return; // すでに決定済みなら abort
+            return { ...current, state: "over", winner };
+        });
 
         setTimeout(async () => {
             try {
